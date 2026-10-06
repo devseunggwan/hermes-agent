@@ -878,8 +878,8 @@ _USAGE_LIMIT_MESSAGE_TOKENS = ("usage limit reached", "usage limit has been reac
 def _failed_credential_identity(agent, pool) -> Tuple[Optional[str], Optional[str]]:
     """``(api_key_hint, credential_id)`` of the key actually dispatched, not ``pool.current()``:
     the shared pointer often points at a different healthy entry, and marking it exhausted
-    can take the whole pool offline from one 429."""
-    api_key_hint = getattr(agent, "api_key", None) or None
+    can take the whole pool offline from one 429. Native Anthropic: ``_anthropic_api_key`` is what was sent."""
+    api_key_hint = (getattr(agent, "_anthropic_api_key", None) if getattr(agent, "api_mode", None) == "anthropic_messages" else None) or getattr(agent, "api_key", None) or None
     raw_id = getattr(agent, "_credential_pool_entry_id", None)
     credential_id = raw_id if isinstance(raw_id, str) and raw_id else None
     if not api_key_hint:

@@ -874,6 +874,24 @@ class ClientLifecycleMixin:
             logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return ok
 
+    def _bound_anthropic_pool_token(self) -> Optional[str]:
+        """Current token of the Anthropic pool entry this agent is bound to; ``None`` when unbound.
+
+        The global resolver hands back the pool's FIRST available token. A session that rotated off a
+        rate-limited entry would otherwise send its next request with that entry's token again the moment
+        its short bench lapses, while the failure is attributed to the entry the session is bound to.
+        Read from auth.json so a refresh committed by another process is picked up.
+        """
+        pool = getattr(self, "_credential_pool", None)
+        entry_id = getattr(self, "_credential_pool_entry_id", None)
+        if pool is None or not entry_id or str(getattr(pool, "provider", "") or "").lower() != "anthropic":
+            return None
+        from agent.credential_pool import load_pool
+        entry = next((e for e in load_pool("anthropic").entries() if e.id == entry_id), None)
+        if entry is None:
+            return None
+        return str(entry.runtime_api_key or "").strip()
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
@@ -893,8 +911,10 @@ class ClientLifecycleMixin:
         if not official_host and not (current_key.startswith("sk-ant-") or getattr(self, "_is_anthropic_oauth", False)):
             return False
         try:
-            from agent.anthropic_credentials import resolve_anthropic_token
-            new_token = resolve_anthropic_token(model=self.model)
+            new_token = self._bound_anthropic_pool_token()
+            if new_token is None:
+                from agent.anthropic_credentials import resolve_anthropic_token
+                new_token = resolve_anthropic_token(model=self.model)
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False

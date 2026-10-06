@@ -3726,39 +3726,8 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     ``failed_api_key`` lets mark_exhausted_and_rotate identify the right pool entry even if
     another process already rotated (current() would be None).
     """
-    normalized = _normalize_aux_provider(provider)
-    try:
-        pool = load_pool(normalized)
-    except Exception as load_exc:
-        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
-        return False
-    if not pool or not pool.has_credentials():
-        return False
-    status_code = getattr(exc, "status_code", None)
-
-    def _rotate(fallback_status: int) -> bool:
-        error_context: Dict[str, Any] = {"message": str(exc)}
-        if status_code is not None:
-            error_context["status_code"] = status_code
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=status_code if status_code is not None else fallback_status,
-            error_context=error_context, api_key_hint=failed_api_key or None,
-        )
-        if next_entry is None:
-            return False
-        _evict_cached_clients(normalized)
-        return True
-
-    if _is_auth_error(exc):
-        if pool.try_refresh_current() is not None:
-            _evict_cached_clients(normalized)
-            return True
-        return _rotate(401)
-    if _is_payment_error(exc):
-        return _rotate(402)
-    if _is_rate_limit_error(exc) and not _is_overloaded_error(exc):
-        return _rotate(429)
-    return False
+    from agent.auxiliary_pool_recovery import recover_provider_pool_entry
+    return recover_provider_pool_entry(provider, exc, failed_api_key=failed_api_key) is not None
 
 
 def _prepare_same_provider_retry(
@@ -7798,18 +7767,23 @@ def _ladder_credential_rungs(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
                 return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+        from agent.auxiliary_pool_recovery import recover_provider_pool_entry
+        recovered_entry = recover_provider_pool_entry(pool_provider, recovery_err, failed_api_key=_client_api_key)
+        if recovered_entry is not None:
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
                         task or "call", tag, pool_provider, type(recovery_err).__name__)
+            # An "auto" route resolves the session's main key (the one that just failed) even with an
+            # explicit key, so the retry names the pool's concrete provider and the rotated entry's key.
+            retry_key = str(getattr(recovered_entry, "runtime_api_key", "") or "") or None
+            retry_target = (pool_provider, route.resolved_model or route.final_model, retry_key)
             try:
-                return (yield _LadderStep(
-                    "retry_same_provider", (resolved_provider, route.resolved_model))), None
+                return (yield _LadderStep("retry_same_provider", retry_target)), None
             except Exception as retry2_err:
                 # Rotated key also hit a wall: mark it now so concurrent processes skip it,
                 # then fall through to the provider fallback.
                 if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                         or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
+                    _recover_provider_pool(pool_provider, retry2_err, failed_api_key=retry_key or "")
                     first_err = retry2_err
                 else:
                     raise
@@ -8142,8 +8116,9 @@ def _ladder_step_call(
     if step.kind == "call":
         return "call", step.args, dict(provider=req.resolved_provider, api_mode=req.resolved_api_mode)
     if step.kind == "retry_same_provider":
-        retry_provider, retry_model = step.args
-        return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model)
+        retry_provider, retry_model, *pin = step.args  # optional third item: the rotated entry's key
+        pinned = {"resolved_api_key": pin[0]} if pin and pin[0] else {}
+        return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model, **pinned)
     return "fallback", step.args, candidate_kwargs
 
 
