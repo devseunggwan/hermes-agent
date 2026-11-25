@@ -83,6 +83,13 @@ class LocalSessionAdapter(BasePlatformAdapter):
     async def edit_message(self, chat_id, message_id, content, *, finalize=False):
         return SendResult(success=True, message_id=message_id)
 
+    async def _deliver_media_attachments(self, event, media_files, local_files, *,
+                                         force_document_attachments, human_delay, metadata, record_delivery):
+        # The reply's MEDIA tags and file paths are already in the transcript viewers render; a
+        # second send has no transport and only logged a false "native send unavailable".
+        for _ in (*media_files, *local_files):
+            record_delivery(SendResult(success=True, message_id=uuid.uuid4().hex))
+
     async def _record_delivery_obligation(self, *args, **kwargs):
         # No platform ACK to lose: viewers replay the durable transcript. A ledger row would only
         # park a raw copy of the reply in state.db that no redelivery can ever use.
